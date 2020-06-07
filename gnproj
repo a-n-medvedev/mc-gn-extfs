@@ -1,0 +1,219 @@
+#! /usr/bin/python3
+
+# Commands:
+# list    archivename
+# copyout archivename storedfilename extractto
+# copyin  archivename storedfilename sourcefile
+# rm      archivename storedfilename
+# mkdir   archivename dirname
+# rmdir   archivename dirname
+# run     archivename soredfilename
+
+import subprocess
+import sys
+import json
+import os.path
+import datetime
+from typing import *
+
+DEPS_PREFIX: Final = '[ -=DEPS=- ]'  # path prefix for dependency browsing tree
+TARGETS: Final = 'targets'
+BUILD_SETTINGS: Final = 'build_settings'
+
+def fatal(message: str) -> NoReturn:
+    """ Prints message and exits script with error code 1
+    :param message: message to be printed
+    :return: never returns
+    """
+    print("ERROR: " + message)
+    exit(1)
+
+
+def read_project() -> dict:
+    """ Reads file passed in second script's command-line argument returning it as a dictionary object.
+    exist script with error code 1 if there is no such argument or it can't be read as a valid JSON file
+    :return: dict object
+    """
+    if len(sys.argv) <= 2:
+        fatal("Command {command} requires mandatory 'archivename' argument but it's missing")
+    projfile: str = sys.argv[2]
+    if not os.path.exists(projfile):
+        fatal("file {} doesn't exist".format(projfile))
+    if not os.path.isfile(projfile):
+        fatal("{} isn't a file".format(projfile))
+    project: Optional[dict] = None
+    try:
+        with open(projfile) as json_file:
+            try:
+                project = json.load(json_file)
+            except Exception as e:
+                fatal("Couldn't read JSON from {} : {}".format(projfile, e))
+            json_file.close()
+    except Exception as e:
+        fatal("Could't open {} : {}".format(projfile, e))
+    if project is None:
+        fatal("Failed to read valid JSON from {}".format(projfile))
+    if TARGETS not in project:
+        fatal('JSON file {} does not contain "{}" key'.format(projfile, TARGETS))
+    return project
+
+
+def tgt2path(target: str) -> str:
+    """ Converts target string like '//path/to:target' or 'path/to:target' to relative 'path/to/:target'
+    path to FS pseudo-object".
+    :param target: string target
+    :return: string representing relative path to target
+    """
+    result: str = target[2:] if target.startswith('//') else target
+    last_colon_offset: int = result.rfind(':')
+    if last_colon_offset > 0:
+        result = result[:last_colon_offset] + '/' + result[last_colon_offset:]
+    return result
+
+
+def json2extfs() -> int:
+    """ Prints out Midnight Commander compatible representation of GN project JSON file as a filesystem object
+    :return: 0 indicating successful read
+    """
+    project: dict = read_project()
+
+    for target_pathname, target_info in project["targets"].items():
+        from os import stat_result
+        stat_info: stat_result = os.stat(sys.argv[2])
+        uid: int = stat_info.st_uid
+        gid: int = stat_info.st_gid
+        time_string: str = datetime.datetime.fromtimestamp(stat_info.st_mtime).strftime("%m-%d-%Y %H:%M:%S")
+        pathname: str = tgt2path(target_pathname)
+
+        print('-r-xr-xr-x 1 {uid} {gid} 100500 {filetime} {pathname}'
+              .format(uid=uid, gid=gid, filetime=time_string, pathname=pathname))
+        for prop, value in target_info.items():
+            if prop in ['configs', 'public_configs']:  # show configs as directory entries
+                for entry in value:
+                    print('-r--r--r-- 1 {uid} {gid} 100500 {filetime} {dp}/{pathname}/{prop}/"{entry}"'
+                          .format(uid=uid, gid=gid, filetime=time_string, pathname=pathname, prop=prop,
+                                  entry=entry.replace("/", "\\"), dp=DEPS_PREFIX))
+            elif prop in ['deps', 'public_deps']:  # show dependencies as directory entries
+                for entry in value:
+                    print(  # link-like dependency representation allows jumping to the corresponding target
+                        'lr--r--r-- 1 {uid} {gid} 100500 {filetime} {dp}/{pathname}/{prop}/{entry} -> /{dp}/{link_target}'
+                            .format(uid=uid, gid=gid, filetime=time_string, pathname=pathname, prop=prop,
+                                    entry=entry.replace("/", "\\"), link_target=tgt2path(entry), dp=DEPS_PREFIX))
+            else:
+                print('-r--r--r-- 1 {uid} {gid} 100500 {filetime} {dp}/{pathname}/{prop}'
+                      .format(uid=uid, gid=gid, filetime=time_string, pathname=pathname, prop=prop, dp=DEPS_PREFIX))
+            pass
+    return 0
+
+
+def entry2path(entry: str) -> str:
+    """ Cuts optional dependency browsing path prefix and removes slash before target name """
+    return (entry[len(DEPS_PREFIX + '/'):] if entry.startswith(DEPS_PREFIX + '/') else entry).replace('/:', ':')
+
+
+def entry2target(entry: str) -> str:
+    return '//' + entry2path(entry)
+
+
+def describe_property(property_name: str, property_value: Union[str, list, dict]) -> List[str]:
+    lines: List[str] = []
+    if type(property_value) is list:
+        if len(property_value) == 0:
+            lines.append(" {} (empty)".format(property_name))
+        else:
+            lines.append(' ' + property_name)
+            for entry in property_value:
+                lines.append('  "{}"'.format(entry))
+    elif type(property_value) is dict:
+        lines.append(' ' + property_name)
+        lines.append("  {}".format(property_value))
+    else:
+        lines.append(' {}: "{}"'.format(property_name, property_value))
+    return lines
+
+
+def target_headline(target_name: str) -> List:
+    lines = ["Target: " + target_name]
+    return lines
+
+
+def read_file() -> int:
+    if len(sys.argv) < 5:
+        exit(1)
+    entry: str = sys.argv[3]
+    dest: str = sys.argv[4]
+    target_name: str = entry2target(entry)
+    project: dict = read_project()
+    targets: dict = project[TARGETS]
+    if target_name in targets:
+        target = targets[target_name]
+        description = target_headline(target_name)
+        # target content
+        for entry, item in target.items():
+            description += describe_property(entry, item)
+        pass
+    else:
+        parent_name = target_name[:target_name.rfind('/')]
+        if parent_name not in targets:
+            return 1
+        # target's property
+        description = target_headline(parent_name)
+        property_name = target_name[len(parent_name) + 1:]
+        description += describe_property(property_name, targets[parent_name][property_name])
+    with open(dest, mode='w+') as content:
+        content.writelines(line + "\n" for line in description)
+        content.close()
+    #    print ("Reading {entry} from GN progect file to {dest} isn't yet implemented".format(entry=entry, dest=dest))
+    return 0
+
+# TODO: Support tool override (through configuration file or environment variable)
+EXECUTE_TOOL='/usr/bin/ninja'
+
+def run() -> int:
+    """ Executes target by invoking ninja tool.
+    :return: 0 indicating successful invocation
+    """
+    if len(sys.argv) < 4:
+        exit(1)
+    if not os.path.exists(EXECUTE_TOOL):
+        exit(1)
+    project: dict = read_project()
+    target: str = entry2path(sys.argv[3])
+    if BUILD_SETTINGS not in project:
+        fatal('There is no "{}" entry in JSON file'.format(BUILD_SETTINGS))
+    settings: dict = project[BUILD_SETTINGS]
+    project_root: str = settings ['root_path']
+    build_dir: str = settings['build_dir'][len('//'):]
+    # TODO: Support build a tool-specific list of arguments (now it's ninja-specific)
+    command: list = [
+        EXECUTE_TOOL,
+        '-C',
+        '{}/{}'.format(project_root, build_dir),
+        target
+    ]
+    print("Executing " + ' '.join(command))
+    subprocess.call(command)
+    return 0
+
+
+def not_implemented():
+    """Does noting returning error code 1"""
+    return 1
+
+
+actions = {'list': json2extfs,
+           'copyout': read_file,
+           'run': run,
+           'copyin': not_implemented,
+           'rm': not_implemented,
+           'mkdir': not_implemented,
+           'rmdir': not_implemented
+           }
+
+if len(sys.argv) <= 1:
+    fatal("Not enough arguments: as minimum command shall be specified")
+action = sys.argv[1]
+if action not in actions:
+    fatal("Unknown command '{}'".format(action))
+
+exit(actions[action]())
